@@ -1,0 +1,88 @@
+import cv2
+import logging
+from pathlib import Path
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+class VideoProcessor:
+    def __init__(self, video_source: str, source_type: str, output_path: str, task_id: str):
+        if not task_id:
+            raise ValueError("CRITICAL ERROR: task_id is required.")
+        
+        self.video_source = video_source
+        self.source_type = source_type
+        self.output_path = output_path
+        self.task_id = task_id
+        self.cap = None
+        self.is_opened = False
+        self.stats = {"frames_with_target": 0, "frames_without_target": 0}
+        
+        # 创建任务根目录
+        self.task_dir = Path(output_path) / task_id
+        self.task_dir.mkdir(parents=True, exist_ok=True)
+        
+        # ✅ 新增：创建 frames 子目录，专门存放图片
+        self.frames_dir = self.task_dir / "frames"
+        self.frames_dir.mkdir(parents=True, exist_ok=True)
+        
+        logger.info(f"VideoProcessor initialized. Task: {self.task_id}, Frames Dir: {self.frames_dir}")
+
+    def open(self) -> bool:
+        try:
+            self.cap = cv2.VideoCapture(self.video_source, cv2.CAP_FFMPEG)
+            if not self.cap.isOpened():
+                logger.error(f"Failed to open video source: {self.video_source}")
+                return False
+            
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 3)
+            self.cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
+            
+            self.is_opened = True
+            logger.info(f"Video source opened: {self.video_source}")
+            return True
+        except Exception as e:
+            logger.error(f"Error opening video: {e}")
+            return False
+
+    def read_frame(self):
+        if not self.is_opened or self.cap is None:
+            return False, None
+        return self.cap.read()
+
+    def save_frame(self, frame, frame_index: int) -> Optional[str]:
+        if frame is None:
+            return None
+        
+        # ✅ 关键修改：保存到 frames 子目录下
+        file_path = self.frames_dir / f"{frame_index}.jpg"
+        
+        try:
+            cv2.imwrite(str(file_path), frame)
+            return str(file_path)
+        except Exception as e:
+            logger.error(f"Failed to save frame {frame_index}: {e}")
+            return None
+
+    def rename_frame(self, old_path: str, frame_index: int, target_code: str) -> Optional[str]:
+        if not old_path:
+            return None
+        
+        old_file = Path(old_path)
+        # 新文件名依然保持在 frames 目录下
+        new_filename = f"{frame_index}_{target_code}.jpg"
+        new_path = old_file.parent / new_filename
+        
+        try:
+            if old_file.exists():
+                old_file.rename(new_path)
+                return str(new_path)
+        except Exception as e:
+            logger.error(f"Failed to rename frame: {e}")
+        return None
+
+    def close(self):
+        if self.cap is not None:
+            self.cap.release()
+            self.is_opened = False
+            logger.info("Video source closed")

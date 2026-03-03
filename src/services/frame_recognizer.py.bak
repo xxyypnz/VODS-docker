@@ -1,0 +1,94 @@
+import os
+import logging
+import json
+import re
+from typing import Dict, Any
+from .dify_recognizer import DifyRecognizer
+
+logger = logging.getLogger(__name__)
+
+class FrameRecognizer:
+    def __init__(self, use_dify: bool = False, dify_api_url: str = "", api_key: str = "", base_image_url: str = ""):
+        self.use_dify = use_dify
+        self.dify_api_url = dify_api_url if dify_api_url else os.getenv("DIFY_API_URL", "")
+        self.api_key = api_key if api_key else os.getenv("DIFY_API_KEY", "")
+        self.base_image_url = (base_image_url if base_image_url else os.getenv("BASE_IMAGE_URL", "http://localhost:8000")).rstrip('/')
+        
+        self.dify_recognizer = None
+        
+        if self.use_dify:
+            if not self.dify_api_url or not self.api_key:
+                raise RuntimeError("Dify mode enabled but missing URL or Key.")
+            prompt = os.getenv("DIFY_PROMPT", "识别图片中的目标：人形 + 绝缘手套，人形 + 抽烟，锥形桶，绝缘手套，塔体锈蚀。请只返回 JSON 格式。")
+            self.dify_recognizer = DifyRecognizer(self.dify_api_url, self.api_key, prompt)
+            logger.info(f"✅ Dify Recognizer initialized. URL: {self.dify_api_url}")
+
+    def recognize(self, frame_index: int, task_id: str) -> Dict[str, Any]:
+        """
+        识别单帧。
+        :raises: RuntimeError 如果 Dify 调用失败 (强制中断流程)。
+        :returns: {"has_target": bool, "target_code": str, "target_name": str}
+        """
+        if not self.use_dify or not self.dify_recognizer:
+            # 如果没启用 Dify，直接返回无目标 (不抛异常，因为这是配置选择)
+            return {"has_target": False, "target_code": "0000", "target_name": "Disabled"}
+
+        image_url = f"{self.base_image_url}/{task_id}/frames/{frame_index}.jpg"
+        logger.info(f"🔍 准备识别 Frame {frame_index}: {image_url}")
+
+        # 调用 Dify (如果这里抛出 RuntimeError，将直接穿透到 main.py)
+        outputs = self.dify_recognizer.recognize(image_url, task_id, frame_index)
+        
+        outputs_text = outputs.get("text", "{}")
+        logger.debug(f"Raw Output: {outputs_text}")
+
+        target_code = "0000"
+        target_name = "No Target"
+        has_target = False
+
+        try:
+            clean_text = re.sub(r'```json|```', '', outputs_text).strip()
+            data = json.loads(clean_text)
+            
+            code = data.get("code") or data.get("target_code") or data.get("id")
+            name = data.get("target") or data.get("target_name") or data.get("name")
+            
+            if code:
+                target_code = str(code)
+                if target_code.isdigit():
+                    target_code = target_code.zfill(4)
+                target_name = name or f"Target {target_code}"
+                has_target = target_code != "0000"
+            else:
+                # 降级匹配
+                if "人形" in outputs_text and "绝缘手套" in outputs_text:
+                    target_code, target_name, has_target = "1001", "人形 + 绝缘手套", True
+                elif "人形" in outputs_text and "抽烟" in outputs_text:
+                    target_code, target_name, has_target = "1002", "人形 + 抽烟", True
+                elif "锥形桶" in outputs_text:
+                    target_code, target_name, has_target = "1003", "锥形桶", True
+                elif "锈蚀" in outputs_text:
+                    target_code, target_name, has_target = "1004", "塔体锈蚀", True
+                elif "人形" in outputs_text:
+                    target_code, target_name, has_target = "1005", "人形", True
+        except Exception as e:
+            logger.warning(f"JSON 解析失败，尝试关键词匹配：{e}")
+            # 再次尝试关键词匹配作为最后手段
+            if "人形" in outputs_text and "绝缘手套" in outputs_text:
+                target_code, target_name, has_target = "1001", "人形 + 绝缘手套", True
+            elif "人形" in outputs_text and "抽烟" in outputs_text:
+                target_code, target_name, has_target = "1002", "人形 + 抽烟", True
+            elif "锥形桶" in outputs_text:
+                target_code, target_name, has_target = "1003", "锥形桶", True
+            elif "锈蚀" in outputs_text:
+                target_code, target_name, has_target = "1004", "塔体锈蚀", True
+            elif "人形" in outputs_text:
+                target_code, target_name, has_target = "1005", "人形", True
+
+        logger.info(f"🎯 [STEP 4] 解析结果：[{target_code}] {target_name}, HasTarget: {has_target}")
+        
+        return {
+            "has_target": has_target,
+            "target_code": target_code,
+            "target_name": target_name
+        }

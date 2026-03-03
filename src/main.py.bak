@@ -1,0 +1,359 @@
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
+import logging
+import asyncio
+import json
+import os
+from datetime import datetime
+from pathlib import Path as FilePath
+from typing import Dict, List, AsyncGenerator, Optional
+import uuid
+
+from .config import settings
+from .models.request import VideoRecognitionRequest
+from .services.video_processor import VideoProcessor
+from .services.frame_recognizer import FrameRecognizer
+from .utils.logger import setup_logger
+from .utils.suggestions_loader import SuggestionsLoader
+
+# Setup logger
+logger = setup_logger("vods", settings.LOG_PATH, settings.LOG_LEVEL)
+suggestions_loader: Optional[SuggestionsLoader] = None
+
+# --- Configuration ---
+DIFY_API_URL = os.getenv("DIFY_API_URL", "http://192.168.0.52:80/v1/workflows/run")
+DIFY_API_KEY = os.getenv("DIFY_API_KEY", "app-ApyUdDu7vG8lvVyftbqiYIfR")
+#BASE_IMAGE_URL = os.getenv("BASE_IMAGE_URL", "http://192.168.0.52:8000")
+BASE_IMAGE_URL = os.getenv("BASE_IMAGE_URL", "http://127.0.0.1:8000")
+
+def init_suggestions():
+    global suggestions_loader
+    try:
+        suggestions_loader = SuggestionsLoader(settings.get_suggestions_path())
+        logger.info(f"Suggestions loaded: {len(suggestions_loader.get_all_codes())} codes")
+    except Exception as e:
+        logger.error(f"Failed to load suggestions: {e}", exc_info=True)
+        suggestions_loader = None
+
+app = FastAPI(title="VODS", description="Video Object Detection with Strict Error Handling", version="1.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+active_tasks: Dict[str, asyncio.Task] = {}
+task_results: Dict[str, Dict] = {}
+
+@app.on_event("startup")
+async def startup_event():
+    logger.info("=" * 60)
+    logger.info("VODS Starting... Strict Error Handling Enabled.")
+    logger.info(f"Dify URL: {DIFY_API_URL}")
+    logger.info(f"Image Base (For Dify): {BASE_IMAGE_URL}")
+    logger.info("=" * 60)
+    init_suggestions()
+    FilePath(settings.OUTPUT_PATH).mkdir(parents=True, exist_ok=True)
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    logger.info("VODS Shutting Down...")
+    for task in active_tasks.values():
+        if not task.done(): task.cancel()
+
+@app.post("/api/v1/video/recognize")
+async def video_recognize(
+    request: VideoRecognitionRequest,
+    mode: str = Query(default="asyn", description="syn=streaming, asyn=background"),
+    use_dify: bool = Query(default=False, description="True=Use Dify AI, False=Use Mock Data")
+):
+    if mode not in ["syn", "asyn"]: 
+        raise HTTPException(400, "mode must be 'syn' or 'asyn'")
+    if len(active_tasks) >= settings.MAX_CONCURRENT_TASKS: 
+        raise HTTPException(429, "Too many tasks")
+    
+    task_id = str(uuid.uuid4())[:12]
+    
+    logger.info("\n\n======================== 接收到视频识别请求，即将开始实时视频识别 ====================================")
+    logger.info(f"[Main] Task {task_id}: Mode={mode}, UseDify={use_dify}, Source={request.video_source[:50]}...")
+    
+    # 初始化识别器 (传入 HTTP 参数)
+    recognizer = FrameRecognizer(
+        use_dify=use_dify, 
+        dify_api_url=DIFY_API_URL, 
+        api_key=DIFY_API_KEY, 
+        base_image_url=BASE_IMAGE_URL
+    )
+    
+    if mode == "syn":
+        async def stream_generator() -> AsyncGenerator[str, None]:
+            processor = VideoProcessor(
+                video_source=request.video_source,
+                source_type=request.source_type,
+                output_path=settings.OUTPUT_PATH,
+                task_id=task_id 
+            )
+            
+            start_time = datetime.now()
+            saved_count = 0
+            recognized_count = 0
+            frame_counter = 0
+            critical_error_occurred = False  # [关键] 标记是否发生致命错误
+            
+            try:
+                yield f"data: {json.dumps({'event': 'start', 'task_id': task_id, 'message': 'Processing started'})}\n\n"
+                
+                #logger.info(f"[Main] Task {task_id}: Opening video source...")
+                if not processor.open():
+                    logger.error(f"[Main] Task {task_id}: Failed to open video source!")
+                    yield f"data: {json.dumps({'event': 'error', 'message': 'Failed to open video source'})}\n\n"
+                    return
+                #logger.info(f"[Main] Task {task_id}: Video source opened successfully.")
+                
+                while processor.is_opened:
+                    ret, frame = processor.read_frame()
+                    if not ret: 
+                        logger.debug("[Main] End of video stream.")
+                        break
+                    
+                    frame_counter += 1
+                    if frame_counter % request.skip_frames != 1: 
+                        continue
+                    
+                    if (datetime.now() - start_time).total_seconds() > request.duration_seconds: 
+                        logger.info(f"[Main] Duration limit reached ({request.duration_seconds}s).")
+                        break
+                    
+                    frame_index = saved_count + 1
+                    
+                    # --- Step 1: Save Frame (保存为 1.jpg, 2.jpg...) ---
+                    #logger.info(f"[Main] 📸 Saving frame {frame_index}...")
+                    file_path = processor.save_frame(frame, frame_index)
+                    if not file_path: 
+                        logger.warning(f"[Main] ⚠️ Failed to save frame {frame_index}. Skipping.")
+                        continue
+                    #logger.info(f"[Main] ✅ Frame {frame_index} saved to: {file_path}")
+                    saved_count += 1
+                    
+                    # --- Step 2: Recognize (可能抛出 RuntimeError) ---
+                    #logger.info(f"[Main] 🚀 Starting recognition for frame {frame_index}...")
+                    
+                    recognition_result = None
+                    
+                    try:
+                        # 如果 Dify 返回 500 或网络错误，这里会抛出 RuntimeError
+                        recognition_result = recognizer.recognize(frame_index, task_id=task_id)
+                    except RuntimeError as e:
+                        # [要求 5] 致命错误：记录日志，标记错误，立即跳出循环，绝不执行重命名
+                        logger.critical(f"[Main] ❌ 致命错误！帧 {frame_index} 识别失败：{e}")
+                        logger.critical(f"[Main] ❌ 任务终止。文件将保持为 {file_path} (未重命名)。")
+                        
+                        yield f"data: {json.dumps({'event': 'error', 'message': f'Critical Dify Error at frame {frame_index}: {str(e)}', 'file': file_path})}\n\n"
+                        critical_error_occurred = True
+                        break  # <--- 关键：立即停止后续所有逻辑
+                    except Exception as e:
+                        # 未知识别异常，也视为致命错误
+                        logger.error(f"[Main] ❌ 未知识别异常：{e}", exc_info=True)
+                        yield f"data: {json.dumps({'event': 'error', 'message': f'Unknown Error: {str(e)}'})}\n\n"
+                        critical_error_occurred = True
+                        break
+
+                    # --- Step 3: Process Result (只有没有发生错误才执行) ---
+                    logger.info(f"[Main] 🏁 Recognition completed for frame {frame_index}: has_target={recognition_result.get('has_target')}")
+                    
+                    has_target = recognition_result.get("has_target", False)
+                    
+                    if has_target:
+                        # 有目标：重命名为 1_CODE.jpg
+                        target_code = recognition_result["target_code"]
+                        logger.info(f"[Main] 🎯 Target detected! Code: [{target_code}]. Renaming file...")
+                        
+                        new_file_path = processor.rename_frame(file_path, frame_index, target_code)
+                        recognized_count += 1
+                        processor.stats["frames_with_target"] += 1
+                        
+                        suggestion = None
+                        if suggestions_loader: 
+                            suggestion = suggestions_loader.get_suggestion(target_code)
+                        
+                        filename = FilePath(new_file_path).name if new_file_path else ""
+                        image_url = f"/api/v1/tasks/{task_id}/frames/{filename}"
+                        
+                        frame_result = {
+                            'event': 'frame', 'task_id': task_id, 'frame_index': frame_index,
+                            'renamed_file': filename,
+                            'target_code': target_code,
+                            'target_name': recognition_result['target_name'],
+                            'has_target': True, 'suggestion': suggestion,
+                            'url': image_url,
+                            'timestamp': datetime.now().isoformat()
+                        }
+                        yield f"data: {json.dumps(frame_result)}\n\n"
+                        logger.info(f"[Main] ✅ Streamed result for frame {frame_index}")
+                        
+                    else:
+                        # 无目标 (明确返回 has_target=False)：重命名为 1_0000.jpg
+                        logger.info(f"[Main] ⭕ No target detected for frame {frame_index}. Renaming to 0000...")
+                        processor.rename_frame(file_path, frame_index, "0000")
+                    
+                    await asyncio.sleep(0.001)
+                
+                # 循环结束后的处理
+                if critical_error_occurred:
+                    logger.warning(f"[Main] ⚠️ Task {task_id} terminated prematurely due to critical error.")
+                    yield f"data: {json.dumps({'event': 'complete', 'task_id': task_id, 'status': 'failed', 'reason': 'Critical error occurred', 'total_frames': saved_count})}\n\n"
+                else:
+                    logger.info(f"[Main] ✅ Task {task_id} completed successfully. Total: {saved_count}, Targets: {recognized_count}")
+                    yield f"data: {json.dumps({'event': 'complete', 'task_id': task_id, 'total_frames': saved_count, 'targets': recognized_count, 'duration': round((datetime.now()-start_time).total_seconds(), 2)})}\n\n"
+                
+            except Exception as e:
+                logger.error(f"[Main] ❌ Critical stream error for task {task_id}: {e}", exc_info=True)
+                yield f"data: {json.dumps({'event': 'error', 'message': str(e)})}\n\n"
+            finally:
+                logger.info(f"[Main] Closing video processor for task {task_id}...")
+                processor.close()
+        
+        return StreamingResponse(stream_generator(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
+    
+    else:
+        # Async Mode (背景任务)
+        async def run_task():
+            processor = None
+            try:
+                logger.info(f"[Main-Async] Starting background task {task_id}...")
+                processor = VideoProcessor(
+                    video_source=request.video_source,
+                    source_type=request.source_type,
+                    output_path=settings.OUTPUT_PATH,
+                    task_id=task_id
+                )
+                # 异步模式下也应用同样的严格逻辑 (简化版，略去 SSE)
+                # 这里为了保持代码简洁，假设异步模式也调用同样的处理逻辑
+                # 实际生产中可能需要重构 process_video_full 以支持异常中断
+                res = await process_video_full(request, task_id, recognizer, processor)
+                task_results[task_id] = res
+                logger.info(f"[Main-Async] Task {task_id} finished successfully.")
+            except RuntimeError as e:
+                logger.critical(f"[Main-Async] Task {task_id} failed with critical error: {e}")
+                task_results[task_id] = {"status": "failed", "message": f"Critical Dify Error: {str(e)}"}
+            except Exception as e:
+                logger.error(f"[Main-Async] Task {task_id} failed: {e}", exc_info=True)
+                task_results[task_id] = {"status": "failed", "message": str(e)}
+            finally:
+                if processor: processor.close()
+                active_tasks.pop(task_id, None)
+        
+        task = asyncio.create_task(run_task())
+        active_tasks[task_id] = task
+        return JSONResponse({"status": "processing", "task_id": task_id})
+
+async def process_video_full(request, task_id, recognizer, processor=None):
+    """异步模式下的处理逻辑 (同样应用严格错误处理)"""
+    if processor is None:
+        processor = VideoProcessor(request.video_source, request.source_type, settings.OUTPUT_PATH, task_id)
+        
+    start_time = datetime.now()
+    frames_result = []
+    try:
+        if not processor.open(): 
+            return {"status": "failed", "message": "Cannot open video"}
+        
+        fc, sc = 0, 0
+        while processor.is_opened:
+            ret, frame = processor.read_frame()
+            if not ret: break
+            fc += 1
+            if fc % request.skip_frames != 1: continue
+            if (datetime.now() - start_time).total_seconds() > request.duration_seconds: break
+            
+            idx = sc + 1
+            fp = processor.save_frame(frame, idx)
+            if not fp: continue
+            sc += 1
+            
+            logger.info(f"[Main-Async] Processing frame {idx}...")
+            try:
+                res = recognizer.recognize(idx, task_id=task_id)
+            except RuntimeError as e:
+                logger.critical(f"[Main-Async] Frame {idx} critical error: {e}")
+                raise e  # 抛出以终止整个任务
+            
+            code = res["target_code"] if res["has_target"] else "0000"
+            
+            if res["has_target"]:
+                logger.info(f"[Main-Async] Frame {idx}: Target [{code}] found.")
+            else:
+                logger.debug(f"[Main-Async] Frame {idx}: No target.")
+                
+            processor.rename_frame(fp, idx, code)
+            
+            filename = FilePath(fp).name.replace(f"{idx}.jpg", f"{idx}_{code}.jpg")
+            frames_result.append({
+                "frame": idx, 
+                "code": code, 
+                "has_target": res["has_target"],
+                "filename": filename,
+                "url": f"/api/v1/tasks/{task_id}/frames/{filename}"
+            })
+            
+            if res["has_target"]: processor.stats["frames_with_target"] += 1
+            else: processor.stats["frames_without_target"] += 1
+            await asyncio.sleep(0.001)
+            
+        return {"status": "success", "task_id": task_id, "total": sc, "targets": processor.stats["frames_with_target"], "frames": frames_result}
+    finally:
+        processor.close()
+
+# ============================================================================
+# APIs
+# ============================================================================
+
+@app.api_route("/api/v1/tasks/{task_id}/frames/{frame_filename}",methods=["GET","HEAD"])
+def get_frame_image(task_id: str, frame_filename: str):
+    path = FilePath(settings.OUTPUT_PATH) / task_id / "frames" / frame_filename
+    if not path.exists():
+        logger.warning(f"Image not found: {path}")
+        raise HTTPException(404, f"Image not found: {frame_filename}")
+    try:
+        if not str(path.resolve()).startswith(str(FilePath(settings.OUTPUT_PATH).resolve())):
+            raise HTTPException(400, "Invalid path")
+    except:
+        raise HTTPException(400, "Invalid path")
+    
+    return FileResponse(
+        path=str(path),
+        media_type="image/jpeg",  # 明确指定为 JPEG 图片，浏览器会尝试渲染
+        filename=frame_filename,  # 这里的 filename 主要用于 Content-Disposition
+        headers={
+            # 强制浏览器内联显示 (inline)，而不是作为附件下载 (attachment)
+            "Content-Disposition": f"inline; filename=\"{frame_filename}\"",
+            # 可选：添加缓存控制，提高预览速度
+            "Cache-Control": "public, max-age=3600"
+        }
+    )
+
+
+
+@app.get("/api/v1/tasks/{task_id}/frames")
+async def list_task_frames(task_id: str):
+    frames_dir = FilePath(settings.OUTPUT_PATH) / task_id / "frames"
+    if not frames_dir.exists():
+        raise HTTPException(404, f"Frames directory not found for task: {task_id}")
+    
+    files = [
+        {"filename": f.name, "url": f"/api/v1/tasks/{task_id}/frames/{f.name}", "size": f.stat().st_size} 
+        for f in sorted(frames_dir.iterdir()) 
+        if f.is_file() and f.suffix.lower() in ['.jpg','.jpeg','.png']
+    ]
+    return {"task_id": task_id, "total": len(files), "frames": files}
+
+@app.get("/api/v1/tasks/{task_id}")
+async def get_task_status(task_id: str):
+    if task_id in task_results: return JSONResponse(task_results[task_id])
+    if task_id in active_tasks: return JSONResponse({"status": "processing"})
+    raise HTTPException(404, "Not found")
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy", "logging": "full", "error_handling": "strict"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("src.main:app", host=settings.SERVICE_HOST, port=settings.SERVICE_PORT, reload=False)
