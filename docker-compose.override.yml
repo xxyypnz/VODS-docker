@@ -1,0 +1,19 @@
+# docker-compose.override.yml
+services:
+  vods:
+    # 1. 覆盖原文件的 network_mode: "host"，改为桥接并映射端口
+    network_mode: "bridge"
+    ports:
+      - "8000:8000"
+    
+    # 2. 映射宿主机，用于解耦特定的局域网 IP
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+      
+    environment:
+      # 3. 在这里写你本地的、安全的 API KEY！它会覆盖原文件里泄露的 Key
+      - DIFY_API_KEY=在这里填入你新生成的安全API_KEY
+      
+      # 4. 覆盖原文件中的固定 IP，改为动态指向宿主机
+      - DIFY_API_URL=http://host.docker.internal:80/v1/workflows/run
+      - BASE_IMAGE_URL=http://host.docker.internal:82
