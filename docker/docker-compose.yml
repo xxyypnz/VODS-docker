@@ -5,46 +5,43 @@ services:
       dockerfile: docker/Dockerfile
     container_name: vods-server
 
-    network_mode: "host"
+    # 1. 移除 network_mode: "host"，改为默认的 bridge 网络模式，并映射端口
+    ports:
+      - "8000:8000"
 
-    user: "${UID:-1000}:${GID:-1000}"  # <--- 添加这一行 (自动读取环境变量，或硬编码为 1000:1000)
-    # ports:
-      #- "8000:8000"
+    user: "${UID:-1000}:${GID:-1000}"
+
+    # 2. 从 .env 读取非敏感配置
+    env_file:
+      - ../.env
+
     environment:
       - USE_DIFY=true
-      - DIFY_API_URL=http://192.168.0.52:80/v1/workflows/run
-      - DIFY_API_KEY=app-ApyUdDu7vG8lvVyftbqiYIfR
+      # 3. 网络解耦：利用 host.docker.internal 访问宿主机上的 Dify 和图片服务
+      - DIFY_API_URL=http://host.docker.internal:80/v1/workflows/run
+      - BASE_IMAGE_URL=http://host.docker.internal:82
       
-      - BASE_IMAGE_URL=http://192.168.0.52:82
-      #- BASE_IMAGE_URL=http://127.0.0.1:8000
-      #- BASE_IMAGE_URL=http://img.vods-local.com:8000
-
+      # 🚨 API-KEY 保护：不要硬编码在这里！从外部读取！
+      - DIFY_API_KEY=${DIFY_API_KEY} 
+      
       - OPENCV_FFMPEG_CAPTURE_OPTIONS=rtsp_transport;tcp
 
-        #- SERVICE_HOST=0.0.0.0
-      - SERVICE_HOST=192.168.0.52
-      - SERVICE_PORT=8000
-      - OUTPUT_PATH=/app/output
-      - DEFAULT_SKIP_FRAMES=20
-      - MAX_CONCURRENT_TASKS=4
-      - LOG_LEVEL=INFO
-
+    # 这里的配置非常关键，让 Linux 上的 host.docker.internal 能解析到宿主机
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
     volumes:
       - /home/pgh/work/docker_vds/src:/app/src
-      # Mount output directory
       - /home/pgh/work/docker_vds/output:/app/output
-      # Mount logs directory
       - /home/pgh/work/docker_vds/logs:/app/logs
-      # Mount video files directory
       - /home/pgh/work/docker_vds/videos:/app/videos:ro
-      # Mount suggestions file
       - /home/pgh/work/docker_vds/suggestions.yaml:/app/suggestions.yaml:ro
+    
     restart: unless-stopped
-    #networks:
-      #- vods-network
+    
+    # 取消网络注释，使用独立的桥接网络
+    networks:
+      - vods-network
 
 networks:
   vods-network:
