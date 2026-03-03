@@ -13,7 +13,7 @@ services:
     environment:
       - USE_DIFY=true
       - DIFY_API_URL=http://192.168.0.52:80/v1/workflows/run
-      - DIFY_API_KEY=app-ApyUdDu7vG8lvVyftbqiYIfR
+      - DIFY_API_KEY="在这里填入你新生成的安全API_KEY"
       
       - BASE_IMAGE_URL=http://192.168.0.52:82
       #- BASE_IMAGE_URL=http://127.0.0.1:8000
